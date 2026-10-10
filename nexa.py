@@ -17,10 +17,6 @@ import math
 import re
 import copy
 import hashlib
-import smtplib
-import ssl
-import socket
-from email.message import EmailMessage
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.lib import colors
@@ -2562,11 +2558,10 @@ def render_diagram_drawing(d, max_width):
 
 # ==============================================================================
 # STUDENT REPORT: validation, report data preparation, offline digital diagnosis,
-# PDF generation and e-mail delivery (pure functions - no Streamlit dependency,
+# PDF generation (pure functions - no Streamlit dependency,
 # so they can be unit tested; the UI lives in the "Generate Report" page).
 # ==============================================================================
 REPORT_YEAR_OPTIONS = ["First Year", "Second Year", "Third Year", "Final Year", "Other (type below)"]
-_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+'\-]+@[A-Za-z0-9](?:[A-Za-z0-9\-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9\-]*[A-Za-z0-9])?)*\.[A-Za-z]{2,}$")
 _DIVISION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 \-]{0,9}$")
 _CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -2605,14 +2600,8 @@ def validate_student_details(raw):
     elif not _DIVISION_RE.match(division):
         errors["division"] = "Division may contain only letters, digits, space or hyphen (max 10 characters)."
 
-    email = _clean_text(raw.get("email"), 254).replace(" ", "")
-    if not email:
-        errors["email"] = "Email ID is required."
-    elif len(email) > 254 or not _EMAIL_RE.match(email) or ".." in email:
-        errors["email"] = "Enter a valid email address (for example name@college.edu)."
-
     clean = {
-        "name": name, "year": year, "division": division.upper() if division else "", "email": email,
+        "name": name, "year": year, "division": division.upper() if division else "",
         "roll_no": _clean_text(raw.get("roll_no"), 40),
         "college": _clean_text(raw.get("college"), 120),
         "branch": _clean_text(raw.get("branch"), 80),
@@ -2729,7 +2718,7 @@ def _gemini_block_digital(res):
 
 
 def build_report_data(record, student, generated_at=None):
-    """Converts a stored test record into the plain data structure used by the PDF/e-mail.
+    """Converts a stored test record into the plain data structure used by the PDF.
     Only values stored in the record are used - nothing is measured or invented here."""
     generated_at = generated_at or datetime.datetime.now()
     res = record["result"]
@@ -2780,7 +2769,7 @@ def build_report_data(record, student, generated_at=None):
 
 
 def report_summary_lines(data):
-    """Short plain-text outcome summary (used by the e-mail body and the UI)."""
+    """Short plain-text outcome summary (used by the PDF and the UI)."""
     if data["kind"] == "digital":
         a = data["analysis"]
         return [f"Overall result: {data['overall_status']}",
@@ -2958,8 +2947,7 @@ def generate_test_report_pdf(data):
     el += [badge, Spacer(1, 6)]
 
     el.append(P("Student Details", "h1"))
-    srows = [("Student name", stu["name"]), ("Year / Academic year", stu["year"]), ("Division", stu["division"]),
-             ("Email ID", stu["email"])]
+    srows = [("Student name", stu["name"]), ("Year / Academic year", stu["year"]), ("Division", stu["division"])]
     for key, lab in (("roll_no", "Roll number"), ("college", "College"), ("branch", "Branch")):
         if stu.get(key):
             srows.append((lab, stu[key]))
@@ -3120,134 +3108,10 @@ def generate_test_report_pdf(data):
     return pdf
 
 
-# ------------------------------------------------------------------------------
-# E-MAIL DELIVERY (SMTP, credentials from environment variables / Streamlit secrets)
-# ------------------------------------------------------------------------------
-SMTP_SETTING_KEYS = ["SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD", "SMTP_SENDER_EMAIL", "SMTP_SECURITY"]
-
-
-def get_smtp_config(env=None, secrets=None):
-    """Builds the SMTP configuration. Environment variables take priority over secrets."""
-    env, secrets = env or {}, secrets or {}
-
-    def pick(key, default=""):
-        val = env.get(key)
-        if val in (None, ""):
-            val = secrets.get(key)
-        return str(val).strip() if val not in (None, "") else default
-    cfg = {"host": pick("SMTP_HOST"), "port_raw": pick("SMTP_PORT", "587"), "username": pick("SMTP_USERNAME"),
-           "password": pick("SMTP_PASSWORD"), "sender": pick("SMTP_SENDER_EMAIL"),
-           "security": pick("SMTP_SECURITY", "").lower()}
-    if not cfg["sender"] and _EMAIL_RE.match(cfg["username"] or ""):
-        cfg["sender"] = cfg["username"]
-    try:
-        cfg["port"] = int(cfg["port_raw"])
-    except ValueError:
-        cfg["port"] = None
-    if cfg["security"] not in ("ssl", "starttls"):
-        cfg["security"] = "ssl" if cfg["port"] == 465 else "starttls"
-    return cfg
-
-
-def smtp_config_problems(cfg):
-    """Returns a list of missing/invalid setting names (empty list == configured)."""
-    problems = []
-    if not cfg.get("host"):
-        problems.append("SMTP_HOST")
-    if cfg.get("port") is None or not (0 < cfg["port"] < 65536):
-        problems.append("SMTP_PORT (must be a number)")
-    if not cfg.get("username"):
-        problems.append("SMTP_USERNAME")
-    if not cfg.get("password"):
-        problems.append("SMTP_PASSWORD")
-    if not cfg.get("sender") or not _EMAIL_RE.match(cfg["sender"]):
-        problems.append("SMTP_SENDER_EMAIL")
-    return problems
-
-
-def build_report_email(sender, recipient, data, pdf_bytes, filename):
-    """Builds the e-mail (plain text + PDF attachment). Sender comes ONLY from server config."""
-    stu = data["student"]
-    circuit = _clean_text(data["circuit"], 80)
-    msg = EmailMessage()
-    msg["Subject"] = f"NEXUS Electronic Circuit Test Report \u2014 {circuit}"
-    msg["From"] = _clean_text(sender, 254)
-    msg["To"] = _clean_text(recipient, 254)
-    lines = [f"Dear {stu['name']},", "",
-             "Please find attached your NEXUS Electronic Circuit Test Report.", "",
-             f"Student name : {stu['name']}", f"Year         : {stu['year']}", f"Division     : {stu['division']}",
-             f"Circuit      : {data['circuit']}", f"Test date    : {data['test_time'].strftime('%Y-%m-%d %H:%M:%S')}",
-             f"Test ID      : {data['test_id']}", ""] + report_summary_lines(data) + [
-             "", "The PDF report is attached to this message.", "",
-             "-- NEXUS - AI-Based Electronic Circuit Tester"]
-    msg.set_content("\n".join(_CTRL_RE.sub(" ", str(l)) for l in lines))
-    msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename=_clean_text(filename, 200))
-    return msg
-
-
-def send_report_email(cfg, message, smtp_cls=None, smtp_ssl_cls=None, timeout=20):
-    """Sends `message`. Returns (ok, human_readable_message). Never raises."""
-    smtp_cls = smtp_cls or smtplib.SMTP
-    smtp_ssl_cls = smtp_ssl_cls or smtplib.SMTP_SSL
-    recipient = message["To"]
-    problems = smtp_config_problems(cfg)
-    if problems:
-        return False, "Email is not configured. Missing/invalid: " + ", ".join(problems) + "."
-    try:
-        ctx = ssl.create_default_context()
-        if cfg["security"] == "ssl":
-            server = smtp_ssl_cls(cfg["host"], cfg["port"], timeout=timeout, context=ctx)
-        else:
-            server = smtp_cls(cfg["host"], cfg["port"], timeout=timeout)
-        with server:
-            if cfg["security"] != "ssl":
-                server.ehlo()
-                server.starttls(context=ctx)
-                server.ehlo()
-            server.login(cfg["username"], cfg["password"])
-            refused = server.send_message(message)
-        if refused:
-            return False, f"The SMTP server refused the recipient address ({recipient})."
-        return True, (f"Email sent successfully: the SMTP server accepted the message for delivery to {recipient}. "
-                      f"SMTP acceptance does not guarantee final inbox delivery - please also check the spam/junk folder.")
-    except smtplib.SMTPAuthenticationError:
-        return False, "Email failed: SMTP authentication was rejected. Check SMTP_USERNAME / SMTP_PASSWORD (an app password may be required)."
-    except smtplib.SMTPRecipientsRefused:
-        return False, f"Email failed: the recipient address {recipient} was refused by the server."
-    except smtplib.SMTPSenderRefused:
-        return False, "Email failed: the sender address was refused. Check SMTP_SENDER_EMAIL."
-    except smtplib.SMTPConnectError:
-        return False, "Email failed: could not connect to the SMTP server. Check SMTP_HOST / SMTP_PORT."
-    except (socket.timeout, TimeoutError):
-        return False, "Email failed: the SMTP server timed out."
-    except ssl.SSLError:
-        return False, "Email failed: a secure (TLS/SSL) connection could not be established. Check SMTP_PORT / SMTP_SECURITY."
-    except smtplib.SMTPException as exc:
-        return False, f"Email failed: SMTP error ({type(exc).__name__})."
-    except OSError as exc:
-        return False, f"Email failed: network error ({type(exc).__name__}). Check the connection and SMTP_HOST."
-    except Exception as exc:  # last resort - never crash the app
-        return False, f"Email failed: unexpected error ({type(exc).__name__})."
-
-
-
 def report_revision_key(student_clean, record):
     """Fingerprint of everything a generated report depends on (details + exact test record)."""
     payload = json.dumps({"student": student_clean, "test_id": record["test_id"], "kind": record["kind"]}, sort_keys=True, default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def load_smtp_settings():
-    """Reads SMTP settings from environment variables, falling back to Streamlit secrets.
-    Never logs or displays the values."""
-    secrets_map = {}
-    try:
-        for key in SMTP_SETTING_KEYS:
-            if key in st.secrets:
-                secrets_map[key] = st.secrets[key]
-    except Exception:
-        secrets_map = {}
-    return get_smtp_config(dict(os.environ), secrets_map)
 
 
 def generate_history_pdf(record):
@@ -4403,11 +4267,11 @@ Respond with a professional engineering diagnostic report.
 
 
 # ------------------------------------------------------------------------------
-# GENERATE REPORT PAGE (student details, PDF generation, download, e-mail)
+# GENERATE REPORT PAGE (student details, PDF generation, download)
 # ------------------------------------------------------------------------------
 elif st.session_state.page == "Generate Report":
     st.header("📑 GENERATE TEST REPORT")
-    st.caption("Create a professional PDF report from a completed NEXUS test, download it, and optionally e-mail it to the student.")
+    st.caption("Create a professional PDF report from a completed NEXUS test, and download it.")
 
     sd = st.session_state.student_details
     records = list(reversed(st.session_state.analysis_records))
@@ -4475,8 +4339,6 @@ elif st.session_state.page == "Generate Report":
     with f_col2:
         in_div = st.text_input("Division *", value=sd.get("division", ""), key="rep_division", max_chars=10, help="For example A, B or C")
         div_slot = st.empty()
-        in_email = st.text_input("Email ID *", value=sd.get("email", ""), key="rep_email", max_chars=254, help="The report PDF is e-mailed to this address.")
-        email_slot = st.empty()
     with st.expander("Optional details (roll number, college, branch, report title)"):
         o1, o2 = st.columns(2)
         with o1:
@@ -4487,7 +4349,7 @@ elif st.session_state.page == "Generate Report":
             in_title = st.text_input("Report title", value=sd.get("report_title", ""), key="rep_title", max_chars=120)
 
     # keep the entered details across reruns / page changes
-    sd.update({"name": in_name, "year": in_year, "year_other": in_year_other, "division": in_div, "email": in_email,
+    sd.update({"name": in_name, "year": in_year, "year_other": in_year_other, "division": in_div,
                "roll_no": in_roll, "college": in_college, "branch": in_branch, "report_title": in_title})
     rep_clean, rep_errors = validate_student_details(sd)
 
@@ -4497,8 +4359,6 @@ elif st.session_state.page == "Generate Report":
         _field_error("year", bool(in_year_other.strip()) if in_year.startswith("Other") else False)
     with div_slot.container():
         _field_error("division", bool(in_div.strip()))
-    with email_slot.container():
-        _field_error("email", bool(in_email.strip()))
 
     # ---- 3. generate -------------------------------------------------------------
     gen_clicked = st.button("📄 Generate PDF Report", key="rep_gen_btn", use_container_width=True,
@@ -4522,19 +4382,18 @@ elif st.session_state.page == "Generate Report":
                     "revision_key": report_revision_key(rep_clean, selected_rec),
                     "test_id": selected_rec["test_id"], "circuit": selected_rec["circuit"],
                     "student": dict(rep_clean), "generated_at": gen_at, "data": report_data,
-                    "email_status": None,
                 }
             except Exception as exc:
                 st.session_state.report_state = None
                 st.error(f"PDF generation failed: {exc}")
 
-    # ---- 4. status, download, e-mail ---------------------------------------------
+    # ---- 4. status and download ---------------------------------------------
     rs = st.session_state.report_state
     if rs is not None:
         cur_key = report_revision_key(rep_clean, selected_rec) if (selected_rec is not None and not rep_errors) else None
         if rs["revision_key"] != cur_key:
             st.warning(f"A report was generated earlier for **{html.escape(rs['circuit'])}** (Test ID {rs['test_id']}), but the student details or "
-                       f"selected test have changed since. Press **Generate PDF Report** again to download or e-mail an up-to-date report.")
+                       f"selected test have changed since. Press **Generate PDF Report** again to download an up-to-date report.")
         else:
             rd = rs["data"]
             st.success(f"PDF report generated at {rs['generated_at'].strftime('%H:%M:%S')} - ready to download.")
@@ -4553,34 +4412,6 @@ elif st.session_state.page == "Generate Report":
 
             st.download_button("⬇️ Download Test Report", data=rs["pdf_bytes"], file_name=rs["filename"],
                                mime="application/pdf", key="rep_download_btn", use_container_width=True)
-
-            st.markdown("#### ✉️ Email Delivery")
-            smtp_cfg = load_smtp_settings()
-            smtp_problems = smtp_config_problems(smtp_cfg)
-            if smtp_problems:
-                st.info("Email delivery is not configured (missing/invalid: " + ", ".join(smtp_problems) + "). "
-                        "The PDF can still be downloaded above. To enable e-mail, set these environment variables or Streamlit secrets "
-                        "(`.streamlit/secrets.toml`): `SMTP_HOST`, `SMTP_PORT` (587 for STARTTLS, 465 for SSL), `SMTP_USERNAME`, "
-                        "`SMTP_PASSWORD`, `SMTP_SENDER_EMAIL`. Optional: `SMTP_SECURITY` = `starttls` or `ssl`.")
-            send_clicked = st.button(f"📧 Send Report to Email ({rs['student']['email']})", key="rep_send_btn",
-                                     use_container_width=True, disabled=bool(smtp_problems))
-            if send_clicked:
-                with st.spinner("Contacting the SMTP server..."):
-                    try:
-                        mail_msg = build_report_email(smtp_cfg["sender"], rs["student"]["email"], rs["data"], rs["pdf_bytes"], rs["filename"])
-                        ok, msg_txt = send_report_email(smtp_cfg, mail_msg)
-                    except Exception as exc:
-                        ok, msg_txt = False, f"Email failed: could not prepare the message ({type(exc).__name__})."
-                rs["email_status"] = {"ok": ok, "message": msg_txt, "at": datetime.datetime.now(), "to": rs["student"]["email"]}
-            es = rs.get("email_status")
-            if es:
-                stamp = es["at"].strftime("%H:%M:%S")
-                if es["ok"]:
-                    st.success(f"[{stamp}] {es['message']}")
-                else:
-                    st.error(f"[{stamp}] {es['message']} The PDF is still available for download above.")
-            else:
-                st.caption("Email status: not sent yet.")
 
 # ------------------------------------------------------------------------------
 # STEP 7: HISTORY PAGE
