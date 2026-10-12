@@ -878,6 +878,8 @@ def init_session_state():
         st.session_state.selected_circuit = "Bridge Rectifier"
     if "page" not in st.session_state:
         st.session_state.page = "Home"
+    if "last_digital_circuit" not in st.session_state:
+        st.session_state.last_digital_circuit = None
     if "api_key" not in st.session_state:
         st.session_state.api_key = ""
     if "historical_tests" not in st.session_state:
@@ -1007,24 +1009,133 @@ def speak_text(text_to_speak):
     """
     st.components.v1.html(tts_html, height=0, width=0)
 
+def is_valid_selection(category, circuit):
+    return category in CIRCUIT_DATABASE and circuit in CIRCUIT_DATABASE[category]
+
+
 def set_active_circuit(category, circuit):
+    """Single authoritative writer of the selected category/circuit.
+    Returns False (and changes nothing) if the pair is not in CIRCUIT_DATABASE."""
+    if not is_valid_selection(category, circuit):
+        return False
+    changed = (st.session_state.get("selected_category") != category
+               or st.session_state.get("selected_circuit") != circuit)
     st.session_state.selected_category = category
     st.session_state.selected_circuit = circuit
-    st.session_state.target_input_voltage = None
-    st.session_state.target_output_voltage = None
-    st.session_state.target_input_current = None
-    st.session_state.target_output_current = None
+    if changed:
+        # Rectifier targets belong to one circuit; never carry them over to another.
+        st.session_state.target_input_voltage = None
+        st.session_state.target_output_voltage = None
+        st.session_state.target_input_current = None
+        st.session_state.target_output_current = None
+    return True
+
 
 def get_current_circuit_data():
-    cat = st.session_state.selected_category
-    ckt = st.session_state.selected_circuit
-    if cat in CIRCUIT_DATABASE and ckt in CIRCUIT_DATABASE[cat]:
+    """Returns the selected circuit's dict, or None if the stored selection is invalid.
+    It never silently substitutes another circuit."""
+    cat = st.session_state.get("selected_category")
+    ckt = st.session_state.get("selected_circuit")
+    if is_valid_selection(cat, ckt):
         return CIRCUIT_DATABASE[cat][ckt]
-    first_cat = list(CIRCUIT_DATABASE.keys())[0]
-    first_ckt = list(CIRCUIT_DATABASE[first_cat].keys())[0]
-    st.session_state.selected_category = first_cat
-    st.session_state.selected_circuit = first_ckt
-    return CIRCUIT_DATABASE[first_cat][first_ckt]
+    return None
+
+
+def ensure_valid_selection():
+    """Only called on pages where the user is *choosing* a circuit (Home / Circuit Type).
+    Repairs a genuinely invalid stored pair; a valid pair is never touched."""
+    cat = st.session_state.get("selected_category")
+    ckt = st.session_state.get("selected_circuit")
+    if cat not in CIRCUIT_DATABASE:
+        cat = "Rectifiers" if "Rectifiers" in CIRCUIT_DATABASE else list(CIRCUIT_DATABASE.keys())[0]
+        ckt = None
+    if ckt not in CIRCUIT_DATABASE[cat]:
+        ckt = "Bridge Rectifier" if (cat == "Rectifiers" and "Bridge Rectifier" in CIRCUIT_DATABASE[cat]) \
+            else list(CIRCUIT_DATABASE[cat].keys())[0]
+    set_active_circuit(cat, ckt)
+
+
+def route_for(category, circuit=None):
+    """Which testing interface a circuit belongs to (driven by CIRCUIT_DATABASE data, not by name)."""
+    info = CIRCUIT_DATABASE.get(category, {}).get(circuit) if circuit else None
+    if category == "Digital Circuits" or (info and info.get("type") in
+            ("logic_gate", "code_converter", "arithmetic", "multiplexer")):
+        return "Digital Circuit Tester"
+    return "Configuration"
+
+
+# ---- navigation callbacks (run BEFORE the next script run, so state is correct when pages render) ----
+def cb_home_category_changed():
+    cat = st.session_state.get("home_cat_select")
+    if cat in CIRCUIT_DATABASE:
+        cur = st.session_state.get("selected_circuit")
+        # keep the current circuit if it belongs to the new category, else first circuit of that category
+        target = cur if cur in CIRCUIT_DATABASE[cat] else list(CIRCUIT_DATABASE[cat].keys())[0]
+        set_active_circuit(cat, target)
+
+
+def cb_home_circuit_changed():
+    ckt = st.session_state.get("home_ckt_select")
+    cat = st.session_state.get("selected_category")
+    if ckt is not None:
+        set_active_circuit(cat, ckt)
+
+
+def cb_digital_circuit_changed():
+    ckt = st.session_state.get("dig_ckt_select")
+    if ckt is not None:
+        set_active_circuit("Digital Circuits", ckt)
+
+
+def cb_launch_selected():
+    """Home -> 'Launch': open the right interface for exactly the selected circuit."""
+    cat = st.session_state.get("selected_category")
+    ckt = st.session_state.get("selected_circuit")
+    if is_valid_selection(cat, ckt):
+        st.session_state.page = route_for(cat, ckt)
+
+
+def cb_launch_digital_module():
+    """Home -> 'Open digital tester': keep a valid digital selection; otherwise open the digital
+    module with the last digital circuit used (or the first one) - and say so on the page."""
+    cat = st.session_state.get("selected_category")
+    ckt = st.session_state.get("selected_circuit")
+    if not (cat == "Digital Circuits" and is_valid_selection(cat, ckt)):
+        digital = list(CIRCUIT_DATABASE["Digital Circuits"].keys())
+        last = st.session_state.get("last_digital_circuit")
+        set_active_circuit("Digital Circuits", last if last in digital else digital[0])
+    st.session_state.page = "Digital Circuit Tester"
+
+
+def cb_load_circuit(category, circuit):
+    if set_active_circuit(category, circuit):
+        st.session_state.page = route_for(category, circuit)
+
+
+def cb_go_home():
+    st.session_state.page = "Home"
+
+
+def render_selection_banner(category, circuit, info, interface):
+    """Prominent confirmation of what the dashboard is actually showing."""
+    sub = info.get("sub_type")
+    kind = f" · TYPE: {html.escape(str(info.get('type')))}" + (f" / {html.escape(str(sub))}" if sub else "") if info.get("type") else ""
+    st.markdown(f"""
+    <div class="os-card" style="border-left: 6px solid #00ff87 !important;">
+        <div style="font-family:Orbitron; font-size:0.72rem; color:#8fa3b8; letter-spacing:2px;">ACTIVE SELECTION · {html.escape(interface)}</div>
+        <div style="font-family:Orbitron; font-size:1.5rem; color:#00ff87; font-weight:700; margin:4px 0;">{html.escape(circuit)}</div>
+        <div style="color:#00f2fe;"><b>CATEGORY:</b> {html.escape(category)}{kind}</div>
+        <div style="margin-top:6px;">{html.escape(str(info.get('description', '')))}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+def render_no_selection_message(page_name):
+    st.header(f"⚠️ {page_name.upper()} - NO CIRCUIT SELECTED")
+    st.warning("No valid circuit is currently selected, so nothing is shown here. "
+               "Pick a category and circuit on the Home page first.")
+    st.button("← RETURN TO HOME", key=f"no_sel_home_{page_name}", on_click=cb_go_home, use_container_width=True)
+
 
 def get_live_sensor_data(circuit_info):
     packet, packet_time = get_latest_packet_and_time()
@@ -3156,6 +3267,332 @@ def generate_history_pdf(record):
 # 4. HOLLYWOOD-QUALITY AI OPERATING SYSTEM INTERFACE & GRAPHICS
 # ------------------------------------------------------------------------------
 st.set_page_config(page_title="NEXUS AI OS v2.3", page_icon="⚡", layout="wide", initial_sidebar_state="expanded")
+# ==============================================================================
+# IC PIN DIAGRAMS (DIP-14 / DIP-16, top view) FOR EVERY DIGITAL CIRCUIT
+# Pin tables below were checked against manufacturer datasheets / pinout references:
+#   7400/7408/7432/7486 (+74HC/74LS): 1A,1B,1Y,2A,2B,2Y,GND | 3Y,3A,3B,4Y,4A,4B,VCC
+#   7402 (NOR) has the OUTPUT first: 1Y,1A,1B,2Y,2A,2B,GND | 3A,3B,3Y,4A,4B,4Y,VCC
+#   7404 (hex inverter): 1A,1Y,2A,2Y,3A,3Y,GND | 4Y,4A,5Y,5A,6Y,6A,VCC
+#   74LS266 (quad XNOR, open collector): 1A,1B,1Y,2Y,2A,2B,GND | 3A,3B,3Y,4Y,4A,4B,VCC
+#   74HC157/74LS157 (quad 2:1 mux): S,1I0,1I1,1Y,2I0,2I1,2Y,GND | 3Y,3I1,3I0,4Y,4I1,4I0,/E,VCC
+# The 7400/7408/7432/7486 family is NOT pin-identical to 7402/7404/74266 - do not reuse one table.
+# ==============================================================================
+IC_PARTS = {
+    "08": {"label": "7408 / 74HC08 / 74LS08", "func": "Quad 2-input AND",
+           "pins": ["1A", "1B", "1Y", "2A", "2B", "2Y", "GND", "3Y", "3A", "3B", "4Y", "4A", "4B", "VCC"]},
+    "00": {"label": "7400 / 74HC00 / 74LS00", "func": "Quad 2-input NAND",
+           "pins": ["1A", "1B", "1Y", "2A", "2B", "2Y", "GND", "3Y", "3A", "3B", "4Y", "4A", "4B", "VCC"]},
+    "32": {"label": "7432 / 74HC32 / 74LS32", "func": "Quad 2-input OR",
+           "pins": ["1A", "1B", "1Y", "2A", "2B", "2Y", "GND", "3Y", "3A", "3B", "4Y", "4A", "4B", "VCC"]},
+    "86": {"label": "7486 / 74HC86 / 74LS86", "func": "Quad 2-input XOR",
+           "pins": ["1A", "1B", "1Y", "2A", "2B", "2Y", "GND", "3Y", "3A", "3B", "4Y", "4A", "4B", "VCC"]},
+    "02": {"label": "7402 / 74HC02 / 74LS02", "func": "Quad 2-input NOR",
+           "pins": ["1Y", "1A", "1B", "2Y", "2A", "2B", "GND", "3A", "3B", "3Y", "4A", "4B", "4Y", "VCC"]},
+    "04": {"label": "7404 / 74HC04 / 74LS04", "func": "Hex inverter (NOT)",
+           "pins": ["1A", "1Y", "2A", "2Y", "3A", "3Y", "GND", "4Y", "4A", "5Y", "5A", "6Y", "6A", "VCC"]},
+    "266": {"label": "74LS266", "func": "Quad 2-input XNOR, open-collector outputs",
+            "pins": ["1A", "1B", "1Y", "2Y", "2A", "2B", "GND", "3A", "3B", "3Y", "4Y", "4A", "4B", "VCC"]},
+    "157": {"label": "74HC157 / 74LS157", "func": "Quad 2:1 multiplexer (one shared select, active-LOW enable)",
+            "pins": ["S", "1I0", "1I1", "1Y", "2I0", "2I1", "2Y", "GND", "3Y", "3I1", "3I0", "4Y", "4I1", "4I0", "/E", "VCC"]},
+}
+
+_IC_COLORS = {"in": "#1565c0", "out": "#2e7d32", "vcc": "#c62828", "gnd": "#37474f",
+              "en": "#ef6c00", "sel": "#ef6c00", "tie": "#6a1b9a", "nc": "#9e9e9e", "net": "#00838f"}
+_IC_LEGEND = [("Input", "in"), ("Output", "out"), ("VCC", "vcc"), ("GND", "gnd"),
+              ("Select / enable", "en"), ("Unused input (tie)", "tie"), ("Internal net", "net")]
+
+
+def _ic_pin_role(name):
+    if name == "VCC":
+        return "vcc"
+    if name == "GND":
+        return "gnd"
+    if name.startswith("/"):
+        return "en"
+    if name == "S":
+        return "sel"
+    if name.endswith("Y"):
+        return "out"
+    return "in"
+
+
+def _ic_pin_no(part, pin_name):
+    return IC_PARTS[part]["pins"].index(pin_name) + 1
+
+
+def _ic_default_label(name):
+    role = _ic_pin_role(name)
+    if role == "vcc":
+        return ("VCC (+5 V, or 2-6 V for HC)", "vcc")
+    if role == "gnd":
+        return ("GND (0 V)", "gnd")
+    if role == "out":
+        return ("not used - leave open", "nc")
+    return ("tie to GND (unused)", "tie")
+
+
+def render_ic_svg(ic):
+    """ic = {"ref","part","conn"}. Returns an SVG string of a top-view DIP package."""
+    part = IC_PARTS[ic["part"]]
+    pins = part["pins"]
+    n = len(pins)
+    m = n // 2
+    pitch, W = 34, 640
+    bx, bw, by = 250, 140, 52
+    bh = 24 + (m - 1) * pitch + 24
+    H = by + bh + 48
+    esc = html.escape
+    o = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="100%" '
+         f'style="max-width:{W}px; font-family:Arial,Helvetica,sans-serif;">']
+    o.append(f'<text x="{W/2}" y="20" text-anchor="middle" font-size="15" font-weight="bold" fill="#102027">'
+             f'{esc(ic["ref"])} - {esc(part["label"])} (DIP-{n})</text>')
+    o.append(f'<text x="{W/2}" y="38" text-anchor="middle" font-size="11" fill="#455a64">'
+             f'{esc(part["func"])} · top view, notch up, pin 1 at top-left</text>')
+    # package body, notch and pin-1 marker
+    o.append(f'<rect x="{bx}" y="{by}" width="{bw}" height="{bh}" rx="6" fill="#eceff1" stroke="#263238" stroke-width="2.2"/>')
+    cx = bx + bw / 2
+    o.append(f'<path d="M {cx-12} {by} A 12 12 0 0 0 {cx+12} {by}" fill="#ffffff" stroke="#263238" stroke-width="2.2"/>')
+    o.append(f'<circle cx="{bx+11}" cy="{by+11}" r="4.5" fill="#263238"/>')
+    o.append(f'<text x="{cx}" y="{by+bh/2}" transform="rotate(-90 {cx} {by+bh/2})" text-anchor="middle" '
+             f'dominant-baseline="middle" font-size="15" font-weight="bold" fill="#90a4ae">{esc(ic["part_short"])}</text>')
+    conn = ic.get("conn", {})
+    for r in range(m):
+        y = by + 24 + r * pitch
+        for side in ("L", "R"):
+            pno = r + 1 if side == "L" else n - r
+            pname = pins[pno - 1]
+            text, kind = conn.get(pname, _ic_default_label(pname))
+            col = _IC_COLORS.get(kind, "#000")
+            if side == "L":
+                sx = bx - 26
+                o.append(f'<rect x="{sx}" y="{y-9}" width="26" height="18" fill="#cfd8dc" stroke="#263238" stroke-width="1.5"/>')
+                o.append(f'<text x="{sx+13}" y="{y+4.5}" text-anchor="middle" font-size="12" font-weight="bold" fill="#000">{pno}</text>')
+                o.append(f'<line x1="{sx-16}" y1="{y}" x2="{sx}" y2="{y}" stroke="{col}" stroke-width="3"/>')
+                o.append(f'<text x="{sx-22}" y="{y+4}" text-anchor="end" font-size="11.5" font-weight="bold" fill="{col}">{esc(text)}</text>')
+                o.append(f'<text x="{bx+10}" y="{y+4.5}" text-anchor="start" font-size="12" font-weight="bold" fill="#102027">{esc(pname)}</text>')
+            else:
+                sx = bx + bw
+                o.append(f'<rect x="{sx}" y="{y-9}" width="26" height="18" fill="#cfd8dc" stroke="#263238" stroke-width="1.5"/>')
+                o.append(f'<text x="{sx+13}" y="{y+4.5}" text-anchor="middle" font-size="12" font-weight="bold" fill="#000">{pno}</text>')
+                o.append(f'<line x1="{sx+26}" y1="{y}" x2="{sx+42}" y2="{y}" stroke="{col}" stroke-width="3"/>')
+                o.append(f'<text x="{sx+48}" y="{y+4}" text-anchor="start" font-size="11.5" font-weight="bold" fill="{col}">{esc(text)}</text>')
+                o.append(f'<text x="{bx+bw-10}" y="{y+4.5}" text-anchor="end" font-size="12" font-weight="bold" fill="#102027">{esc(pname)}</text>')
+    # legend
+    ly = by + bh + 26
+    lx = 12
+    for lab, k in _IC_LEGEND:
+        o.append(f'<rect x="{lx}" y="{ly-8}" width="10" height="10" fill="{_IC_COLORS[k]}"/>')
+        o.append(f'<text x="{lx+14}" y="{ly+1}" font-size="10" fill="#37474f">{esc(lab)}</text>')
+        lx += 14 + 6.3 * len(lab) + 14
+    o.append('</svg>')
+    return "".join(o)
+
+
+def _IN(x):
+    return (f"IN {x}", "in")
+
+
+def _OUT(x, extra=""):
+    return (f"OUT {x}{extra}", "out")
+
+
+def _NET(x, driven=False):
+    return (f"{'→ ' if driven else ''}{x}", "net")
+
+
+_SIMPLE_GATE_PART = {"AND": "08", "NAND": "00", "OR": "32", "NOR": "02", "XOR": "86", "XNOR": "266"}
+
+
+def build_ic_plan(sub_type, width=4):
+    """Returns {"ics": [...], "nets": [...], "notes": [...]} for a digital circuit, or None if unsupported.
+    ic = {"ref", "part", "part_short", "role", "conn": {pin_name: (label, kind)}}"""
+    ics, nets, notes = [], [], []
+
+    def add(ref, part, role, conn):
+        ics.append({"ref": ref, "part": part, "part_short": IC_PARTS[part]["label"].split(" / ")[0],
+                    "role": role, "conn": conn})
+
+    def net(name, meaning, driver, loads):
+        nets.append({"net": name, "meaning": meaning, "driver": driver, "loads": loads})
+
+    if sub_type in _SIMPLE_GATE_PART:
+        part = _SIMPLE_GATE_PART[sub_type]
+        ypin = "1Y"
+        y_extra = " (+1 kΩ pull-up to VCC)" if part == "266" else ""
+        add("U1", part, f"{sub_type} gate (gate 1 of 4)",
+            {"1A": _IN("A"), "1B": _IN("B"), ypin: _OUT("Y", y_extra)})
+        notes.append("Only gate 1 is used; the other three gates are unused - their inputs are tied to GND so they cannot float.")
+        if part == "266":
+            notes.append("74LS266 has OPEN-COLLECTOR outputs: it cannot drive a HIGH by itself. Connect a 1 kΩ (1-10 kΩ) "
+                         "pull-up resistor from output pin 3 to VCC, otherwise the output never reads logic 1.")
+            notes.append("Alternative with push-pull outputs: build XNOR from a 7486 (XOR) followed by a 7404 inverter.")
+        if part == "02":
+            notes.append("Caution: the 7402 NOR has a different pinout from 7400/7408/7432/7486 - the output of each gate comes first (pin 1 = 1Y).")
+    elif sub_type == "NOT":
+        add("U1", "04", "Inverter 1 of 6", {"1A": _IN("A"), "1Y": _OUT("Y")})
+        notes.append("Only inverter 1 is used; the other five inverters have their inputs tied to GND.")
+    elif sub_type == "bin_to_gray":
+        n = max(2, min(int(width), 4))
+        conn = {}
+        for k, i in enumerate(range(n - 2, -1, -1), start=1):
+            conn[f"{k}A"] = _IN(f"B{i+1}")
+            conn[f"{k}B"] = _IN(f"B{i}")
+            conn[f"{k}Y"] = _OUT(f"G{i}")
+        add("U1", "86", f"{n - 1} XOR gate(s): G(i) = B(i+1) ⊕ B(i)", conn)
+        notes.append(f"The MSB needs no gate: G{n-1} = B{n-1}. Use the same wire for input B{n-1} and output G{n-1}.")
+        if n > 2:
+            fan = ", ".join(f"B{i}" for i in range(n - 2, 0, -1))
+            notes.append(f"{fan} each feed two XOR gates (fan-out of 2), and B{n-1} feeds one gate plus the G{n-1} output wire - join those wires on the breadboard.")
+        else:
+            notes.append("B1 feeds the XOR gate and also the G1 output wire - join them on the breadboard.")
+        notes.append(f"Bit width follows the 'Select Bit Width' control ({n} bits).")
+    elif sub_type == "gray_to_bin":
+        n = max(2, min(int(width), 4))
+        conn = {}
+        for k in range(1, n):
+            out_bit = n - 1 - k
+            conn[f"{k}A"] = _IN(f"G{n-1}") if k == 1 else _NET(f"B{out_bit+1}")
+            conn[f"{k}B"] = _IN(f"G{out_bit}")
+            conn[f"{k}Y"] = _OUT(f"B{out_bit}", " → next" if k < n - 1 else "")
+            if k > 1:
+                net(f"B{out_bit+1}", f"Binary bit B{out_bit+1} (output of gate {k-1})",
+                    ("U1", f"{k-1}Y"), [("U1", f"{k}A")])
+        add("U1", "86", f"{n - 1} cascaded XOR gate(s): B(i) = B(i+1) ⊕ G(i)", conn)
+        notes.append(f"The MSB needs no gate: B{n-1} = G{n-1} (use the same wire). Gate 1 takes G{n-1} and G{n-2}.")
+        notes.append("This is a ripple chain: each gate's output is wired into the A input of the next gate.")
+        notes.append(f"Bit width follows the 'Select Bit Width' control ({n} bits).")
+    elif sub_type == "half_adder":
+        add("U1", "86", "Sum = A ⊕ B", {"1A": _IN("A"), "1B": _IN("B"), "1Y": _OUT("Sum")})
+        add("U2", "08", "Carry = A · B", {"1A": _IN("A"), "1B": _IN("B"), "1Y": _OUT("Carry")})
+        notes.append("Inputs A and B each go to BOTH ICs (U1 and U2) - join them on the breadboard.")
+    elif sub_type == "full_adder":
+        add("U1", "86", "XOR gates: N1 = A ⊕ B, Sum = N1 ⊕ Cin",
+            {"1A": _IN("A"), "1B": _IN("B"), "1Y": _NET("N1", True),
+             "2A": _NET("N1"), "2B": _IN("Cin"), "2Y": _OUT("Sum")})
+        add("U2", "08", "AND gates: N2 = A · B, N3 = N1 · Cin",
+            {"1A": _IN("A"), "1B": _IN("B"), "1Y": _NET("N2", True),
+             "2A": _NET("N1"), "2B": _IN("Cin"), "2Y": _NET("N3", True)})
+        add("U3", "32", "OR gate: Cout = N2 + N3",
+            {"1A": _NET("N2"), "1B": _NET("N3"), "1Y": _OUT("Carry-out")})
+        net("N1", "A ⊕ B", ("U1", "1Y"), [("U1", "2A"), ("U2", "2A")])
+        net("N2", "A · B", ("U2", "1Y"), [("U3", "1A")])
+        net("N3", "Cin · (A ⊕ B)", ("U2", "2Y"), [("U3", "1B")])
+        notes.append("Needs three ICs (7486, 7408, 7432). A, B and Cin each fan out to two gates; N1 fans out to U1 and U2.")
+    elif sub_type == "half_subtractor":
+        add("U1", "86", "Difference = A ⊕ B", {"1A": _IN("A"), "1B": _IN("B"), "1Y": _OUT("Difference")})
+        add("U2", "04", "Inverter: N1 = A'", {"1A": _IN("A"), "1Y": _NET("N1", True)})
+        add("U3", "08", "Borrow = A' · B", {"1A": _NET("N1"), "1B": _IN("B"), "1Y": _OUT("Borrow")})
+        net("N1", "A' (NOT A)", ("U2", "1Y"), [("U3", "1A")])
+        notes.append("A goes to U1 and U2; B goes to U1 and U3.")
+    elif sub_type == "full_subtractor":
+        add("U1", "86", "XOR gates: N1 = A ⊕ B, Difference = N1 ⊕ Bin",
+            {"1A": _IN("A"), "1B": _IN("B"), "1Y": _NET("N1", True),
+             "2A": _NET("N1"), "2B": _IN("Bin"), "2Y": _OUT("Difference")})
+        add("U2", "04", "Inverters: N2 = A', N3 = (A ⊕ B)'",
+            {"1A": _IN("A"), "1Y": _NET("N2", True), "2A": _NET("N1"), "2Y": _NET("N3", True)})
+        add("U3", "08", "AND gates: N4 = A' · B, N5 = N3 · Bin",
+            {"1A": _NET("N2"), "1B": _IN("B"), "1Y": _NET("N4", True),
+             "2A": _NET("N3"), "2B": _IN("Bin"), "2Y": _NET("N5", True)})
+        add("U4", "32", "OR gate: Borrow-out = N4 + N5",
+            {"1A": _NET("N4"), "1B": _NET("N5"), "1Y": _OUT("Borrow-out")})
+        net("N1", "A ⊕ B", ("U1", "1Y"), [("U1", "2A"), ("U2", "2A")])
+        net("N2", "A'", ("U2", "1Y"), [("U3", "1A")])
+        net("N3", "(A ⊕ B)'", ("U2", "2Y"), [("U3", "2A")])
+        net("N4", "A' · B", ("U3", "1Y"), [("U4", "1A")])
+        net("N5", "(A ⊕ B)' · Bin", ("U3", "2Y"), [("U4", "1B")])
+        notes.append("Needs four ICs (7486, 7404, 7408, 7432). Borrow-out = A'·B + (A ⊕ B)'·Bin, matching the truth table in this module.")
+    elif sub_type == "mux_2_1":
+        add("U1", "157", "2:1 mux, section 1 of 4",
+            {"S": ("IN S (select)", "sel"), "1I0": _IN("I0"), "1I1": _IN("I1"), "1Y": _OUT("Y"),
+             "/E": ("GND (enable, active LOW)", "en")})
+        notes.append("The 74157 contains FOUR 2:1 multiplexers that share ONE select pin (pin 1) and ONE enable pin (pin 15). "
+                     "This test uses section 1 only (1I0 = pin 2, 1I1 = pin 3, 1Y = pin 4).")
+        notes.append("Select S = 0 routes I0 to Y; S = 1 routes I1 to Y - same as Y = S'·I0 + S·I1.")
+        notes.append("The enable pin /E (pin 15) is ACTIVE LOW: it MUST be tied to GND. If it is HIGH (or floating) all outputs are forced LOW and the mux will appear dead.")
+        notes.append("The unused data inputs of sections 2-4 are tied to GND; their outputs (pins 7, 9, 12) are left open.")
+    else:
+        return None
+    return {"ics": ics, "nets": nets, "notes": notes}
+
+
+def ic_wiring_rows(plan):
+    rows = []
+    for ic in plan["ics"]:
+        pins = IC_PARTS[ic["part"]]["pins"]
+        used = {}
+        for pname, (text, kind) in ic["conn"].items():
+            used[_ic_pin_no(ic["part"], pname)] = (pname, text, kind)
+        used[14 if len(pins) == 14 else 16] = ("VCC", "+5 V supply (decouple with 0.1 µF to GND)", "vcc")
+        used[7 if len(pins) == 14 else 8] = ("GND", "GND (common ground with ESP32 / sensor)", "gnd")
+        for pno in sorted(used):
+            pname, text, kind = used[pno]
+            rows.append({"IC": f"{ic['ref']} ({ic['part_short']})", "Pin": pno, "Pin name": pname,
+                         "Role": {"in": "Input", "out": "Output", "vcc": "Power", "gnd": "Power", "en": "Enable/Select",
+                                  "sel": "Select", "net": "Internal net", "tie": "Unused input", "nc": "Unused"}.get(kind, kind),
+                         "Connect to": text})
+    return rows
+
+
+def ic_unused_pin_notes(plan):
+    out = []
+    for ic in plan["ics"]:
+        pins = IC_PARTS[ic["part"]]["pins"]
+        tie, openp = [], []
+        for i, pname in enumerate(pins, start=1):
+            if pname in ic["conn"] or pname in ("VCC", "GND"):
+                continue
+            (tie if _ic_pin_role(pname) in ("in",) else openp if _ic_pin_role(pname) == "out" else tie).append(i)
+        part_txt = f"{ic['ref']} ({ic['part_short']})"
+        if tie:
+            out.append(f"{part_txt}: tie unused input pins {', '.join(map(str, tie))} to GND.")
+        if openp:
+            out.append(f"{part_txt}: leave unused output pins {', '.join(map(str, openp))} unconnected.")
+    return out
+
+
+def render_ic_pin_section(sub_type, width=4):
+    plan = build_ic_plan(sub_type, width)
+    if plan is None:
+        st.warning(f"No IC pin diagram is defined for sub-type '{sub_type}'.")
+        return
+    ics = plan["ics"]
+    st.markdown("**ICs required:**")
+    for ic in ics:
+        p = IC_PARTS[ic["part"]]
+        st.markdown(f"- **{ic['ref']} - {p['label']}** ({p['func']}) → {ic['role']}")
+    cols_n = 1 if len(ics) == 1 else 2
+    for start in range(0, len(ics), cols_n):
+        chunk = ics[start:start + cols_n]
+        cols = st.columns(cols_n)
+        for col, ic in zip(cols, chunk):
+            m = len(IC_PARTS[ic["part"]]["pins"]) // 2
+            h = 52 + (24 + (m - 1) * 34 + 24) + 48 + 24
+            with col:
+                st.components.v1.html(
+                    f'<div style="background:#ffffff; border-radius:10px; padding:8px; box-sizing:border-box;">{render_ic_svg(ic)}</div>',
+                    height=int(h) + 16, scrolling=True)
+    st.markdown("**Wiring table**")
+    st.dataframe(pd.DataFrame(ic_wiring_rows(plan)), use_container_width=True, hide_index=True)
+    if plan["nets"]:
+        st.markdown("**Internal nets (wire these between ICs)**")
+        net_rows = []
+        for nt in plan["nets"]:
+            drv_ref, drv_pin = nt["driver"]
+            dpart = next(i for i in ics if i["ref"] == drv_ref)["part"]
+            loads = []
+            for lref, lpin in nt["loads"]:
+                lpart = next(i for i in ics if i["ref"] == lref)["part"]
+                loads.append(f"{lref} pin {_ic_pin_no(lpart, lpin)} ({lpin})")
+            net_rows.append({"Net": nt["net"], "Meaning": nt["meaning"],
+                             "From": f"{drv_ref} pin {_ic_pin_no(dpart, drv_pin)} ({drv_pin})", "To": ", ".join(loads)})
+        st.dataframe(pd.DataFrame(net_rows), use_container_width=True, hide_index=True)
+    st.markdown("**Notes**")
+    for line in plan["notes"] + ic_unused_pin_notes(plan):
+        st.markdown(f"- {line}")
+    st.caption("Power: 74LS/7400 parts need +5 V; 74HC parts run from 2-6 V (use 3.3 V HC if your ESP32 inputs are not 5 V tolerant). "
+               "Add a 0.1 µF capacitor close to each IC's VCC/GND pins and join all grounds. Pin numbers are for the DIP package, top view.")
+
+
 init_session_state()
 
 # Canvas Background JS
@@ -3574,7 +4011,7 @@ if is_mute != st.session_state.is_muted:
     if is_mute:
         speak_text("")
 
-curr_circuit = get_current_circuit_data()
+curr_circuit = get_current_circuit_data()   # None when the stored selection is invalid (never substituted)
 
 # ------------------------------------------------------------------------------
 # STEP 1: HOME PAGE
@@ -3601,34 +4038,37 @@ if st.session_state.page == "Home":
         st.warning("⚠️ **STANDBY MODE**: Gemini AI Engine is running in offline mode. Configure API key in OS Settings.")
 
     st.markdown("### 🎛️ Circuit System Selection")
+    # selected_category / selected_circuit are the single source of truth. Widget keys are re-synced
+    # from them BEFORE the widgets are created (legal), and the on_change callbacks write back.
+    ensure_valid_selection()
+    st.session_state["home_cat_select"] = st.session_state.selected_category
+    st.session_state["home_ckt_select"] = st.session_state.selected_circuit
+
     st.markdown('<div class="os-card">', unsafe_allow_html=True)
     c1, c2 = st.columns(2)
-    
+
     with c1:
-        chosen_cat = st.selectbox(
-            "SYSTEM CATEGORY", 
-            list(CIRCUIT_DATABASE.keys()), 
-            index=list(CIRCUIT_DATABASE.keys()).index(st.session_state.selected_category),
-            key="home_cat_select"
+        st.selectbox(
+            "SYSTEM CATEGORY",
+            list(CIRCUIT_DATABASE.keys()),
+            key="home_cat_select",
+            on_change=cb_home_category_changed,
         )
-        st.session_state.selected_category = chosen_cat
 
     with c2:
-        available_ckts = list(CIRCUIT_DATABASE[st.session_state.selected_category].keys())
-        default_ckt_idx = available_ckts.index(st.session_state.selected_circuit) if st.session_state.selected_circuit in available_ckts else 0
-        chosen_ckt = st.selectbox(
-            "TARGET CIRCUIT TOPOLOGY", 
-            available_ckts, 
-            index=default_ckt_idx,
-            key="home_ckt_select"
+        st.selectbox(
+            "TARGET CIRCUIT TOPOLOGY",
+            list(CIRCUIT_DATABASE[st.session_state.selected_category].keys()),
+            key="home_ckt_select",
+            on_change=cb_home_circuit_changed,
         )
-        st.session_state.selected_circuit = chosen_ckt
 
     curr_circuit = get_current_circuit_data()
 
     st.markdown(f"""
         <hr style='border:0; height:1px; background: rgba(0,242,254,0.2); margin:18px 0;'>
         <h3 style="color:#00ff87 !important; margin-top:0;">LOADED TOPOLOGY: {st.session_state.selected_circuit}</h3>
+        <p style="font-size: 1.05rem;"><b>CATEGORY:</b> {st.session_state.selected_category}</p>
         <p style="font-size: 1.05rem;"><b>FUNCTION:</b> {curr_circuit['description']}</p>
         <p style="font-size: 1.0rem; color:#00f2fe;"><b>COMPONENTS:</b> {curr_circuit.get('components', curr_circuit.get('diagram', 'N/A'))}</p>
         <p><b>SCHEMATIC VECTOR:</b> <code style="color:#00ff87; background:rgba(0,0,0,0.6); padding:6px 12px; border-radius:4px; border:1px solid rgba(0,255,135,0.3);">{curr_circuit['diagram']}</code></p>
@@ -3637,22 +4077,20 @@ if st.session_state.page == "Home":
 
     c_h1, c_h2 = st.columns(2)
     with c_h1:
-        if st.button("INITIALIZE SYSTEM CONFIGURATION →", use_container_width=True):
-            if st.session_state.selected_category == "Digital Circuits":
-                st.session_state.page = "Digital Circuit Tester"
-            else:
-                st.session_state.page = "Configuration"
-            st.rerun()
+        dest = route_for(st.session_state.selected_category, st.session_state.selected_circuit)
+        st.button("LAUNCH / TEST SELECTED CIRCUIT →", key="home_launch_btn", use_container_width=True,
+                  on_click=cb_launch_selected,
+                  help=f"Opens the {dest} for exactly: {st.session_state.selected_circuit}")
     with c_h2:
-        if st.button("LAUNCH DIGITAL TESTER MODULE →", use_container_width=True):
-            st.session_state.selected_category = "Digital Circuits"
-            st.session_state.page = "Digital Circuit Tester"
-            st.rerun()
+        st.button("OPEN DIGITAL TESTER MODULE →", key="home_launch_digital_btn", use_container_width=True,
+                  on_click=cb_launch_digital_module,
+                  help="Opens the digital module. If the selected circuit is not digital, the last-used (or first) digital circuit is opened and clearly labelled.")
 
 # ------------------------------------------------------------------------------
 # STEP 2: CATEGORY / TYPE BROWSER PAGE
 # ------------------------------------------------------------------------------
 elif st.session_state.page == "Circuit Type":
+    ensure_valid_selection()
     st.header(f"📂 CIRCUIT CATALOG ARCHIVE: {st.session_state.selected_category}")
     cols = st.columns(2)
     for idx, (c_name, c_info) in enumerate(CIRCUIT_DATABASE[st.session_state.selected_category].items()):
@@ -3664,19 +4102,17 @@ elif st.session_state.page == "Circuit Type":
                 <p style="color:#00ff87;"><b>Details:</b> {c_info.get('components', c_info.get('diagram', 'N/A'))}</p>
             </div>
             """, unsafe_allow_html=True)
-            if st.button(f"LOAD {c_name.upper()}", key=f"btn_{c_name}"):
-                set_active_circuit(st.session_state.selected_category, c_name)
-                if st.session_state.selected_category == "Digital Circuits":
-                    st.session_state.page = "Digital Circuit Tester"
-                else:
-                    st.session_state.page = "Configuration"
-                st.rerun()
+            st.button(f"LOAD {c_name.upper()}", key=f"btn_{st.session_state.selected_category}_{c_name}",
+                      on_click=cb_load_circuit, args=(st.session_state.selected_category, c_name))
 
 # ------------------------------------------------------------------------------
 # STEP 3: CONFIGURATION
 # ------------------------------------------------------------------------------
 elif st.session_state.page == "Configuration":
-    if st.session_state.selected_category == "Digital Circuits":
+    if curr_circuit is None:
+        render_no_selection_message("Configuration")
+        st.stop()
+    if route_for(st.session_state.selected_category, st.session_state.selected_circuit) == "Digital Circuit Tester":
         st.session_state.page = "Digital Circuit Tester"
         st.rerun()
     st.header(f"⚙️ TARGET CONFIGURATION - {st.session_state.selected_circuit}")
@@ -3722,7 +4158,10 @@ elif st.session_state.page == "Configuration":
 # STEP 4: PROBE GUIDE
 # ------------------------------------------------------------------------------
 elif st.session_state.page == "Probe Guide":
-    if st.session_state.selected_category == "Digital Circuits":
+    if curr_circuit is None:
+        render_no_selection_message("Probe Guide")
+        st.stop()
+    if route_for(st.session_state.selected_category, st.session_state.selected_circuit) == "Digital Circuit Tester":
         st.session_state.page = "Digital Circuit Tester"
         st.rerun()
     st.header(f"📍 SENSOR PROBE CALIBRATION - {st.session_state.selected_circuit}")
@@ -3743,9 +4182,22 @@ elif st.session_state.page == "Probe Guide":
 # STEP 5: TESTING DASHBOARD (AUTOMATIC 1-SECOND LIVE TELEMETRY REFRESH)
 # ------------------------------------------------------------------------------
 elif st.session_state.page == "Testing Dashboard":
-    if st.session_state.selected_category == "Digital Circuits":
+    if curr_circuit is None:
+        render_no_selection_message("Testing Dashboard")
+        st.stop()
+    if route_for(st.session_state.selected_category, st.session_state.selected_circuit) == "Digital Circuit Tester":
         st.session_state.page = "Digital Circuit Tester"
         st.rerun()
+    render_selection_banner(st.session_state.selected_category, st.session_state.selected_circuit,
+                            curr_circuit, "ELECTRICAL TESTING DASHBOARD")
+    with st.expander("📘 Circuit details: components, expected values, probe instructions", expanded=False):
+        st.markdown(f"**Components:** {curr_circuit.get('components', 'N/A')}")
+        st.markdown(f"**Schematic:** `{curr_circuit.get('diagram', 'N/A')}`")
+        st.markdown(f"**Expected (nominal):** Vin {curr_circuit.get('exp_input_v')} V · Iin {curr_circuit.get('exp_input_i')} A · "
+                    f"Vout {curr_circuit.get('exp_output_v')} V · Iout {curr_circuit.get('exp_output_i')} A · "
+                    f"Efficiency {curr_circuit.get('exp_eff')} % · Ripple {curr_circuit.get('exp_ripple')} %")
+        for _p in curr_circuit.get("probes", []):
+            st.markdown(f"- **Probe {_p['step']} - {_p['name']}:** {_p['loc']}")
     st.header(f"📊 LIVE AI OS DIAGNOSTIC MATRIX - {st.session_state.selected_circuit}")
     st.caption(f"Hardware Topology Specs: {curr_circuit.get('components', 'N/A')}")
     
@@ -3843,8 +4295,9 @@ elif st.session_state.page == "Testing Dashboard":
     if analyze_clicked:
         run_gemini_analysis(curr_circuit, active_targets)
 
-    if st.session_state.last_gemini_result is not None:
-        render_analysis_result(st.session_state.last_gemini_result)
+    _last = st.session_state.last_gemini_result
+    if _last is not None and _last.get("circuit") == st.session_state.selected_circuit:
+        render_analysis_result(_last)
     elif not data_available:
         st.info("No valid sensor data available for analysis. Waiting for ESP32 telemetry.")
     else:
@@ -3913,16 +4366,33 @@ elif st.session_state.page == "Digital Circuit Tester":
     st.caption("Verify logic gates, code converters, arithmetic circuits, and the mandatory 2:1 multiplexer using live single-voltage sensor telemetry.")
 
     digital_circuits_list = list(CIRCUIT_DATABASE["Digital Circuits"].keys())
-    selected_dig_ckt = st.selectbox("SELECT DIGITAL CIRCUIT", digital_circuits_list, index=0, key="dig_ckt_select")
-    st.session_state.selected_category = "Digital Circuits"
-    st.session_state.selected_circuit = selected_dig_ckt
+
+    # Authoritative state -> widget. Nothing here ever overwrites the selection with index=0.
+    if st.session_state.selected_category != "Digital Circuits" or \
+            not is_valid_selection("Digital Circuits", st.session_state.selected_circuit):
+        # Arrived (e.g. via the sidebar) while a non-digital circuit is selected: ask, don't substitute.
+        _prev = st.session_state.get("selected_circuit")
+        st.warning(f"The currently selected circuit ({st.session_state.get('selected_category')} → {_prev}) "
+                   "is not a digital circuit. Choose a digital circuit below, or go back to Home.")
+        st.session_state.pop("dig_ckt_select", None)
+        st.selectbox("SELECT DIGITAL CIRCUIT", digital_circuits_list, index=None,
+                     placeholder="Choose a digital circuit…", key="dig_ckt_select",
+                     on_change=cb_digital_circuit_changed)
+        st.button("← RETURN TO HOME", key="dig_no_sel_home", on_click=cb_go_home)
+        st.stop()
+
+    st.session_state["dig_ckt_select"] = st.session_state.selected_circuit
+    st.selectbox("SELECT DIGITAL CIRCUIT", digital_circuits_list, key="dig_ckt_select",
+                 on_change=cb_digital_circuit_changed)
+    selected_dig_ckt = st.session_state.selected_circuit
+    st.session_state.last_digital_circuit = selected_dig_ckt
     ckt_info = CIRCUIT_DATABASE["Digital Circuits"][selected_dig_ckt]
 
+    render_selection_banner("Digital Circuits", selected_dig_ckt, ckt_info, "DIGITAL TESTING DASHBOARD")
     st.markdown(f"""
     <div class="os-card">
-        <h3 style="color:#00f2fe; margin-top:0;">⚡ {selected_dig_ckt}</h3>
-        <p><b>Description:</b> {ckt_info['description']}</p>
         <p><b>Schematic:</b> <code style="color:#00ff87; background:rgba(0,0,0,0.6); padding:4px 10px;">{ckt_info['diagram']}</code></p>
+        <p><b>Inputs:</b> {", ".join(ckt_info.get("inputs", []))} &nbsp;|&nbsp; <b>Outputs:</b> {", ".join(ckt_info.get("outputs", []))}</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -4000,6 +4470,12 @@ elif st.session_state.page == "Digital Circuit Tester":
                 st.code("\n".join(_exprs), language=None)
     except Exception as _diag_err:
         st.warning(f"The circuit diagram could not be rendered ({_diag_err}). Schematic summary: {ckt_info.get('diagram', 'N/A')}")
+
+    st.markdown("### 🔌 IC Pin Diagram and Wiring")
+    try:
+        render_ic_pin_section(ckt_info.get("sub_type"), st.session_state.digital_bit_width)
+    except Exception as _ic_err:
+        st.warning(f"The IC pin diagram could not be rendered ({_ic_err}).")
 
     st.markdown("### 📋 Expected Truth Table (Deterministic)")
     st.dataframe(expected_df, use_container_width=True)
